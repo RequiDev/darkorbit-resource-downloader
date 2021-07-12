@@ -120,11 +120,8 @@ namespace darkorbit_resource_downloader
 			{
 				var url = $"https://darkorbit-22.bpsecure.com/spacemap/{location}{file.Name}.{file.Type}";
 
-				using (var sr = new StreamReader(WebRequest.Create(url).GetResponse().GetResponseStream() ?? throw new InvalidOperationException()))
-				using (var sw = new StreamWriter(filePath))
-				{
-					sw.Write(sr.ReadToEnd());
-				}
+                using var wc = new WebClient();
+                wc.DownloadFileAsync(new Uri(url), filePath);
 
 				Console.WriteLine($"Downloaded {file.Name}.{file.Type}");
 			}
