@@ -121,7 +121,7 @@ namespace darkorbit_resource_downloader
 				var url = $"https://darkorbit-22.bpsecure.com/spacemap/{location}{file.Name}.{file.Type}";
 
                 using var wc = new WebClient();
-                wc.DownloadFileAsync(new Uri(url), filePath);
+                wc.DownloadFile(new Uri(url), filePath);
 
 				Console.WriteLine($"Downloaded {file.Name}.{file.Type}");
 			}
