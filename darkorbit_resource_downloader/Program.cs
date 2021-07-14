@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Net;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
@@ -70,40 +71,86 @@ namespace darkorbit_resource_downloader
 		private static int _totalFiles;
 
 		private static void Main(string[] args)
-		{
-			if (System.IO.File.Exists("resources.xml"))
-			{
-				LocalCollection = XmlToT<FileCollection>(System.IO.File.ReadAllText("resources.xml"));
+        {
+            var xmlFiles = new List<string>()
+            {
+                "https://darkorbit-22.bpsecure.com/spacemap/xml/resources.xml",
+                "https://darkorbit-22.bpsecure.com/spacemap/xml/resources_3d.xml",
+                "https://darkorbit-22.bpsecure.com/do_img/global/xml/resource_items.xml"
+            };
+
+			Console.WriteLine($"You can choose from these xml files to parse and download:");
+            for (var i = 0; i < xmlFiles.Count; i++)
+            {
+                const string pattern = @"(.+)xml\/(.+\.xml)";
+                var match = Regex.Match(xmlFiles[i], pattern);
+                var file = match.Groups[2].Value;
+
+				Console.WriteLine($"{i} - {file}");
+            }
+
+			Console.Write("Type in your desired index to download the file. Anything else to download all of them: ");
+
+            var input = Console.ReadLine();
+            if (!int.TryParse(input, out var index) || index >= xmlFiles.Count)
+            {
+                foreach (var xmlFile in xmlFiles)
+                {
+					ParseAndDownloadXmlFile(xmlFile);
+                }
+            }
+            else
+            {
+                ParseAndDownloadXmlFile(xmlFiles[index]);
 			}
-			else
-			{
-				LocalCollection = new FileCollection
-				{
-					Files = new List<File>(),
-					Locations = new List<Location>()
-				};
-			}
-
-			var resourceXml = new WebClient().DownloadString("https://darkorbit-22.bpsecure.com/spacemap/xml/resources.xml");
-			RemoteCollection = XmlToT<FileCollection>(resourceXml);
-			_totalFiles = RemoteCollection.Files.Count;
-			System.IO.File.WriteAllText("resources.xml", resourceXml);
-
-			Console.Write($"Found {RemoteCollection.Files.Count} files to download. Do you want to continue? (y/n): ");
-			var answer = Console.ReadKey();
-			if (answer.Key != ConsoleKey.Y)
-				return;
-
-			var sw = new Stopwatch();
-			Console.WriteLine("\nDownloading files now...");
-			sw.Start();
-			Parallel.ForEach(RemoteCollection.Files, new ParallelOptions {MaxDegreeOfParallelism = 10 }, DownloadFile);
-			sw.Stop();
-			Console.WriteLine($"Done! Downloaded in {sw.Elapsed}. Skipped {_skippedFiles}/{_totalFiles} Files.");
-			Console.ReadLine();
 		}
 
-		private static void DownloadFile(File file)
+        private static void ParseAndDownloadXmlFile(string url)
+        {
+            const string pattern = @"(.+)xml\/(.+\.xml)";
+            var match = Regex.Match(url, pattern);
+
+            var baseUrl = match.Groups[1].Value;
+			var xmlFile = match.Groups[2].Value;
+            if (System.IO.File.Exists(xmlFile))
+            {
+                LocalCollection = XmlToT<FileCollection>(System.IO.File.ReadAllText(xmlFile));
+            }
+            else
+            {
+                LocalCollection = new FileCollection
+                {
+                    Files = new List<File>(),
+                    Locations = new List<Location>()
+                };
+            }
+
+            var resourceXml = new WebClient().DownloadString(url);
+            RemoteCollection = XmlToT<FileCollection>(resourceXml);
+            _totalFiles = RemoteCollection.Files.Count;
+            System.IO.File.WriteAllText(xmlFile, resourceXml);
+
+            Console.Write($"Found {RemoteCollection.Files.Count} files to download for {xmlFile}. Do you want to continue? (y/n): ");
+            var answer = Console.ReadKey();
+            if (answer.Key != ConsoleKey.Y)
+                return;
+
+            var sw = new Stopwatch();
+            Console.WriteLine("\nDownloading files now...");
+            sw.Start();
+            Parallel.ForEach(RemoteCollection.Files, new ParallelOptions
+            {
+                MaxDegreeOfParallelism = 10
+            }, f =>
+            {
+                DownloadFile(baseUrl, f);
+            });
+            sw.Stop();
+            Console.WriteLine($"Done! Downloaded in {sw.Elapsed}. Skipped {_skippedFiles}/{_totalFiles} Files.");
+            Console.ReadLine();
+		}
+
+		private static void DownloadFile(string baseUrl, File file)
 		{
 			var location = RemoteCollection.Locations.Find(loc => loc.Id == file.Location).Path;
 			Directory.CreateDirectory($"do_resources/{location}");
@@ -118,7 +165,7 @@ namespace darkorbit_resource_downloader
 			}
 			else
 			{
-				var url = $"https://darkorbit-22.bpsecure.com/spacemap/{location}{file.Name}.{file.Type}";
+				var url = $"{baseUrl}{location}{file.Name}.{file.Type}";
 
                 using var wc = new WebClient();
                 wc.DownloadFile(new Uri(url), filePath);
@@ -130,10 +177,8 @@ namespace darkorbit_resource_downloader
 		private static T XmlToT<T>(string xml)
 		{
 			var serializer = new XmlSerializer(typeof(T));
-			using (TextReader reader = new StringReader(xml))
-			{
-				return (T)serializer.Deserialize(reader);
-			}
-		}
+            using TextReader reader = new StringReader(xml);
+            return (T)serializer.Deserialize(reader);
+        }
 	}
 }
