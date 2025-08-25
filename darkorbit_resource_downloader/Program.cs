@@ -4,10 +4,14 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Serialization;
+using Spectre.Console;
+using System.Threading.RateLimiting;
+using Polly;
 
 namespace darkorbit_resource_downloader
 {
@@ -64,50 +68,129 @@ namespace darkorbit_resource_downloader
 		public List<File> Files { get; set; }
 	}
 
-	internal static class Program
-	{
-		private static FileCollection RemoteCollection { get; set; }
-		private static FileCollection LocalCollection { get; set; }
-		private static int _skippedFiles;
-		private static int _totalFiles;
+    internal static class Program
+    {
+        private static FileCollection RemoteCollection { get; set; }
+        private static FileCollection LocalCollection { get; set; }
+        private static int _skippedFiles;
+        private static int _totalFiles;
+        private static int _maxParallel = 10;
+        private static double _rps = 6; // requests per second budget
+        private static int _burst = 6;   // burst tokens
+        private static int _retries = 3; // retry attempts
+        private static HttpClient Http = default!;
+        private static RateLimiter _rateLimiter = default!;
 
-		private static void Main(string[] args)
+        private static HttpClient CreateHttpClient(int maxConnections)
         {
-            var xmlFiles = new List<string>()
+            var handler = new SocketsHttpHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.GZip | System.Net.DecompressionMethods.Deflate,
+                MaxConnectionsPerServer = Math.Max(1, maxConnections),
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                EnableMultipleHttp2Connections = true
+            };
+
+            var client = new HttpClient(handler)
+            {
+                Timeout = TimeSpan.FromMinutes(10)
+            };
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("darkorbit-resource-downloader/1.0");
+            return client;
+        }
+
+        private static RateLimiter CreateRateLimiter(double rps, int burst)
+        {
+            var tokensPerPeriod = Math.Max(1, (int)Math.Ceiling(rps));
+            return new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+            {
+                TokenLimit = Math.Max(1, burst),
+                QueueLimit = 0,
+                ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+                TokensPerPeriod = tokensPerPeriod,
+                AutoReplenishment = true
+            });
+        }
+
+        private static async Task Main(string[] args)
+        {
+            ParseArgs(args);
+            Http = CreateHttpClient(_maxParallel);
+            _rateLimiter = CreateRateLimiter(_rps, _burst);
+            var xmlFiles = new List<string>
             {
                 "https://darkorbit-22.bpsecure.com/spacemap/xml/resources.xml",
                 "https://darkorbit-22.bpsecure.com/spacemap/xml/resources_3d.xml",
                 "https://darkorbit-22.bpsecure.com/do_img/global/xml/resource_items.xml"
             };
 
-			Console.WriteLine($"You can choose from these xml files to parse and download:");
-            for (var i = 0; i < xmlFiles.Count; i++)
+            var fileChoices = xmlFiles
+                .Select(url => XmlPattern.Match(url).Groups[2].Value)
+                .ToList();
+
+            var selection = AnsiConsole.Prompt(
+                new SelectionPrompt<string>()
+                    .Title("[bold]Select a resource XML to download[/] (or choose All)")
+                    .PageSize(10)
+                    .AddChoices(fileChoices.Prepend("All"))
+            );
+
+            if (selection == "All")
             {
-                const string pattern = @"(.+)xml\/(.+\.xml)";
-                var match = Regex.Match(xmlFiles[i], pattern);
-                var file = match.Groups[2].Value;
-
-				Console.WriteLine($"{i} - {file}");
-            }
-
-			Console.Write("Type in your desired index to download the file. Anything else to download all of them: ");
-
-            var input = Console.ReadLine();
-            if (!int.TryParse(input, out var index) || index >= xmlFiles.Count)
-            {
-                foreach (var xmlFile in xmlFiles)
+                foreach (var xmlFileUrl in xmlFiles)
                 {
-					ParseAndDownloadXmlFile(xmlFile);
+                    await ParseAndDownloadXmlFile(xmlFileUrl);
                 }
             }
             else
             {
-                ParseAndDownloadXmlFile(xmlFiles[index]);
-			}
-		}
+                var selectedUrl = xmlFiles[fileChoices.IndexOf(selection)];
+                await ParseAndDownloadXmlFile(selectedUrl);
+            }
+        }
+
+        private static void ParseArgs(string[] args)
+        {
+            for (int i = 0; i < args.Length; i++)
+            {
+                var a = args[i];
+                if (string.Equals(a, "--max-parallel", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var mp) && mp > 0)
+                    {
+                        _maxParallel = mp;
+                        i++;
+                    }
+                }
+                else if (string.Equals(a, "--rps", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && double.TryParse(args[i + 1], out var rps) && rps > 0)
+                    {
+                        _rps = rps;
+                        i++;
+                    }
+                }
+                else if (string.Equals(a, "--burst", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var burst) && burst > 0)
+                    {
+                        _burst = burst;
+                        i++;
+                    }
+                }
+                else if (string.Equals(a, "--retries", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (i + 1 < args.Length && int.TryParse(args[i + 1], out var retries) && retries >= 0)
+                    {
+                        _retries = retries;
+                        i++;
+                    }
+                }
+            }
+        }
 
         private static readonly Regex XmlPattern = new Regex(@"(.+)xml\/(.+\.xml)", RegexOptions.Compiled);
-        private static void ParseAndDownloadXmlFile(string url)
+        private static async Task ParseAndDownloadXmlFile(string url)
         {
             var match = XmlPattern.Match(url);
 
@@ -115,7 +198,7 @@ namespace darkorbit_resource_downloader
 			var xmlFile = match.Groups[2].Value;
             if (System.IO.File.Exists(xmlFile))
             {
-                LocalCollection = XmlToT<FileCollection>(System.IO.File.ReadAllText(xmlFile));
+                LocalCollection = XmlToT<FileCollection>(await System.IO.File.ReadAllTextAsync(xmlFile));
             }
             else
             {
@@ -126,61 +209,198 @@ namespace darkorbit_resource_downloader
                 };
             }
 
-            using var wc = new WebClient();
-            var resourceXml = wc.DownloadString(url);
+            var resourceXml = await GetStringWithRetryAsync(url);
             RemoteCollection = XmlToT<FileCollection>(resourceXml);
             _totalFiles = RemoteCollection.Files.Count;
-            System.IO.File.WriteAllText(xmlFile, resourceXml);
+            await System.IO.File.WriteAllTextAsync(xmlFile, resourceXml);
 
-            Console.Write($"Found {RemoteCollection.Files.Count} files to download for {xmlFile}. Do you want to continue? (y/n): ");
-            var answer = Console.ReadKey();
-            if (answer.Key != ConsoleKey.Y)
+            if (!AnsiConsole.Confirm($"Found {RemoteCollection.Files.Count} files for [yellow]{xmlFile}[/]. Proceed?"))
                 return;
 
             var sw = new Stopwatch();
-            Console.WriteLine("\nDownloading files now...");
             sw.Start();
-            Parallel.ForEach(RemoteCollection.Files, new ParallelOptions
-            {
-                MaxDegreeOfParallelism = 10
-            }, f =>
-            {
-                DownloadFile(baseUrl, f);
-            });
+
+            AnsiConsole.Write(new Rule($"[green]Downloading {xmlFile}[/]"));
+
+            await AnsiConsole.Progress()
+                .AutoClear(false)
+                .Columns(new ProgressColumn[]
+                {
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                    new RemainingTimeColumn(),
+                    new SpinnerColumn()
+                })
+                .StartAsync(async ctx =>
+                {
+                    var overall = ctx.AddTask("[green]Overall[/]");
+                    overall.MaxValue = RemoteCollection.Files.Count;
+
+                    var throttler = new SemaphoreSlim(_maxParallel);
+                    var tasks = new List<Task>();
+
+                    foreach (var f in RemoteCollection.Files)
+                    {
+                        await throttler.WaitAsync();
+                        var t = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await DownloadFileWithProgress(ctx, baseUrl, f);
+                            }
+                            finally
+                            {
+                                overall.Increment(1);
+                                throttler.Release();
+                            }
+                        });
+                        tasks.Add(t);
+                    }
+
+                    await Task.WhenAll(tasks);
+                });
+
             sw.Stop();
-            Console.WriteLine($"Done! Downloaded in {sw.Elapsed}. Skipped {_skippedFiles}/{_totalFiles} Files.");
+            AnsiConsole.MarkupLine($"[bold green]Done![/] Elapsed: [yellow]{sw.Elapsed}[/]. Skipped [yellow]{_skippedFiles}[/]/[yellow]{_totalFiles}[/] files.");
+            AnsiConsole.MarkupLine("Press Enter to exit...");
             Console.ReadLine();
 		}
 
-		private static void DownloadFile(string baseUrl, File file)
+        private static async Task DownloadFileWithProgress(ProgressContext ctx, string baseUrl, File file)
         {
             var loc = RemoteCollection.Locations.FirstOrDefault(loc => loc.Id == file.Location);
             if (loc == null)
             {
-                Console.WriteLine($"Unable to find location for {file.Location}");
+                AnsiConsole.MarkupLine($"[red]Unable to find location for[/] [yellow]{file.Location}[/]");
                 return;
             }
-			var location = loc.Path;
-			Directory.CreateDirectory($"do_resources/{location}");
+            var location = loc.Path;
+            Directory.CreateDirectory($"do_resources/{location}");
 
-			var filePath = $"do_resources/{location}{file.Name}.{file.Type}";
+            var filePath = $"do_resources/{location}{file.Name}.{file.Type}";
 
-			var localFile = LocalCollection.Files.Find(f => f == file);
-			if (System.IO.File.Exists(filePath) && localFile?.Hash == file.Hash)
-			{
-				Console.WriteLine($"Skipped {file.Name}.{file.Type}");
-				Interlocked.Increment(ref _skippedFiles);
-			}
-			else
-			{
-				var url = $"{baseUrl}{location}{file.Name}.{file.Type}";
+            var localFile = LocalCollection.Files.Find(f => f == file);
+            if (System.IO.File.Exists(filePath) && localFile?.Hash == file.Hash)
+            {
+                AnsiConsole.MarkupLine($"[grey]Skipped[/] {file.Name}.{file.Type}");
+                Interlocked.Increment(ref _skippedFiles);
+            }
+            else
+            {
+                var url = $"{baseUrl}{location}{file.Name}.{file.Type}";
 
-                using var wc = new WebClient();
-                wc.DownloadFile(new Uri(url), filePath);
+                var task = ctx.AddTask($"{file.Name}.{file.Type}");
 
-				Console.WriteLine($"Downloaded {file.Name}.{file.Type}");
-			}
-		}
+                using var response = await SendWithRetryAsync(url);
+                response.EnsureSuccessStatusCode();
+                var contentLength = response.Content.Headers.ContentLength;
+
+                if (contentLength.HasValue && contentLength.Value > 0)
+                {
+                    task.MaxValue = contentLength.Value;
+                }
+                else
+                {
+                    task.MaxValue = 100; // fallback when size unknown
+                }
+
+                await using var input = await response.Content.ReadAsStreamAsync();
+                await using var output = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
+
+                var buffer = new byte[81920];
+                long totalRead = 0;
+                int read;
+                while ((read = await input.ReadAsync(buffer)) > 0)
+                {
+                    await output.WriteAsync(buffer.AsMemory(0, read));
+                    totalRead += read;
+
+                    if (contentLength is > 0)
+                    {
+                        task.Value = Math.Min(totalRead, contentLength.Value);
+                    }
+                    else
+                    {
+                        // Tick up to simulate progress
+                        task.Increment(1);
+                        if (task.Value >= task.MaxValue)
+                            task.Value = 0; // loop when unknown size
+                    }
+                }
+
+                task.StopTask();
+
+                AnsiConsole.MarkupLine($"[green]Downloaded[/] {file.Name}.{file.Type}");
+            }
+        }
+
+        
+
+        private static async Task<HttpResponseMessage> SendWithRetryAsync(string url)
+        {
+            // Simple async retry with jitter and respect Retry-After when present
+            for (int attempt = 1; attempt <= Math.Max(1, _retries + 1); attempt++)
+            {
+                using var lease = await _rateLimiter.AcquireAsync(1);
+                var response = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+
+                if ((int)response.StatusCode < 400)
+                    return response;
+
+                // 429 or 5xx: decide to retry
+                if (attempt > _retries || (response.StatusCode != System.Net.HttpStatusCode.TooManyRequests && (int)response.StatusCode < 500))
+                {
+                    return response; // caller will EnsureSuccessStatusCode or handle
+                }
+
+                TimeSpan delay = ComputeDelay(response, attempt);
+                response.Dispose();
+                await Task.Delay(delay);
+            }
+
+            // Should not reach here
+            return await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+        }
+
+        private static async Task<string> GetStringWithRetryAsync(string url)
+        {
+            using var resp = await SendWithRetryAsync(url);
+            resp.EnsureSuccessStatusCode();
+            return await resp.Content.ReadAsStringAsync();
+        }
+
+        private static TimeSpan ComputeDelay(HttpResponseMessage response, int attempt)
+        {
+            if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+            {
+                if (response.Headers.RetryAfter != null)
+                {
+                    if (response.Headers.RetryAfter.Delta.HasValue)
+                        return response.Headers.RetryAfter.Delta.Value + Jitter(250);
+                    if (response.Headers.RetryAfter.Date.HasValue)
+                    {
+                        var delta = response.Headers.RetryAfter.Date.Value - DateTimeOffset.UtcNow;
+                        if (delta > TimeSpan.Zero)
+                            return delta + Jitter(250);
+                    }
+                }
+                return TimeSpan.FromSeconds(1) + Jitter(250);
+            }
+            // Exponential backoff with jitter
+            double baseMs = 500 * Math.Pow(2, attempt - 1);
+            baseMs = Math.Min(baseMs, 8000);
+            return TimeSpan.FromMilliseconds(baseMs) + Jitter(250);
+        }
+
+        private static TimeSpan Jitter(int maxMs)
+        {
+            var rand = System.Security.Cryptography.RandomNumberGenerator.Create();
+            var bytes = new byte[4];
+            rand.GetBytes(bytes);
+            int v = BitConverter.ToInt32(bytes, 0) & int.MaxValue;
+            return TimeSpan.FromMilliseconds(v % Math.Max(1, maxMs));
+        }
 
 		private static T XmlToT<T>(string xml)
 		{

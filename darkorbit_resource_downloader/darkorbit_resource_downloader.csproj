@@ -10,4 +10,10 @@
 	<InformationalVersion>$(Version)</InformationalVersion>
   </PropertyGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.50.0" />
+    <PackageReference Include="System.Threading.RateLimiting" Version="9.0.8" />
+    <PackageReference Include="Polly" Version="8.6.3" />
+  </ItemGroup>
+
 </Project>
