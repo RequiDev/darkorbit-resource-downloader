@@ -5,7 +5,7 @@ on:
     branches: [ "master" ]
 
 permissions:
-  contents: write   # needed to push tags & create releases
+  contents: write
 
 jobs:
   build:
@@ -16,6 +16,12 @@ jobs:
       matrix:
         rid: [ linux-x64, win-x64, osx-x64, osx-arm64 ]
 
+    env:
+      RID: ${{ matrix.rid }}
+      # Path to your main project (edit if different)
+      PROJECT: darkorbit_resource_downloader/darkorbit_resource_downloader.csproj
+      SOLUTION: darkorbit_resource_downloader.sln
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,21 +30,47 @@ jobs:
         with:
           dotnet-version: 9.0.x
 
-      - name: Restore
-        run: dotnet restore
+      # Version first so we can embed it
+      - name: Compute next version (patch bump)
+        id: ver
+        run: |
+          git fetch --tags --force
+          latest=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [ -z "$latest" ]; then base="0.1.0"; else base=${latest#v}; fi
+          IFS='.' read -r MA MI PA <<<"$base"
+          PA=$((PA+1))
+          echo "version=$MA.$MI.$PA" >> $GITHUB_OUTPUT
 
-      - name: Build
-        run: dotnet build --configuration Release --no-restore
+      - name: Restore (solution)
+        run: dotnet restore "$SOLUTION"
 
-      # Publish for each runtime (framework-dependent by default)
-      # If you want self-contained binaries, add: --self-contained true
+      - name: Build (solution, no RID here)
+        run: dotnet build "$SOLUTION" --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test "$SOLUTION" --configuration Release --no-build --verbosity normal
+
+      # RID-specific restore for the project you'll publish
+      - name: Restore (project, RID-specific)
+        run: dotnet restore "$PROJECT" -r $RID
+
+      # ✅ Build the project for this RID so publish has outputs to copy
+      - name: Build (project, RID-specific)
+        run: dotnet build "$PROJECT" -c Release -r $RID -p:Version=${{ steps.ver.outputs.version }} --no-restore
+
       - name: Publish (${{ matrix.rid }})
-        run: dotnet publish --configuration Release -r ${{ matrix.rid }} -o publish/${{ matrix.rid }} --no-build
+        run: |
+          dotnet publish "$PROJECT" \
+            -c Release \
+            -r $RID \
+            -p:Version=${{ steps.ver.outputs.version }} \
+            -o publish/$RID \
+            --no-build
 
       - name: Archive artifact (${{ matrix.rid }})
         run: |
-          cd publish/${{ matrix.rid }}
-          zip -r ../../app-${{ matrix.rid }}.zip .
+          cd publish/$RID
+          zip -r "../../app-${RID}.zip" .
         shell: bash
 
       - name: Upload artifact (${{ matrix.rid }})
@@ -48,30 +80,29 @@ jobs:
           path: app-${{ matrix.rid }}.zip
 
   tag_and_release:
-    name: Bump version, tag, and release
+    name: Tag and release
     needs: build
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # we need tags/history
+          fetch-depth: 0
 
-      - name: Compute next version (patch bump)
+      - name: Recompute next version (same logic)
         id: ver
         run: |
-          git fetch --tags
+          git fetch --tags --force
           latest=$(git tag -l 'v*' --sort=-v:refname | head -n1)
-          if [ -z "$latest" ]; then
-            new="0.1.0"
-          else
-            base=${latest#v}
-            IFS='.' read -r MA MI PA <<<"$base"
-            PA=$((PA+1))
-            new="$MA.$MI.$PA"
-          fi
-          echo "version=$new" >> $GITHUB_OUTPUT
+          if [ -z "$latest" ]; then base="0.1.0"; else base=${latest#v}; fi
+          IFS='.' read -r MA MI PA <<<"$base"
+          PA=$((PA+1))
+          echo "version=$MA.$MI.$PA" >> $GITHUB_OUTPUT
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Create and push tag
         run: |
@@ -88,9 +119,6 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: v${{ steps.ver.outputs.version }}
-          draft: false
-          prerelease: false
-          files: |
-            dist/**/*
+          files: dist/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
