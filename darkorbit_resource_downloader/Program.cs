@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -12,7 +13,7 @@ namespace darkorbit_resource_downloader
 {
 	public class File
 	{
-		[XmlAttribute("debugView")]
+        [XmlAttribute("debugView")]
 		public bool DebugView { get; set; }
 
 		[XmlAttribute("hash")]
@@ -63,7 +64,7 @@ namespace darkorbit_resource_downloader
 		public List<File> Files { get; set; }
 	}
 
-	internal class Program
+	internal static class Program
 	{
 		private static FileCollection RemoteCollection { get; set; }
 		private static FileCollection LocalCollection { get; set; }
@@ -105,10 +106,10 @@ namespace darkorbit_resource_downloader
 			}
 		}
 
+        private static readonly Regex XmlPattern = new Regex(@"(.+)xml\/(.+\.xml)", RegexOptions.Compiled);
         private static void ParseAndDownloadXmlFile(string url)
         {
-            const string pattern = @"(.+)xml\/(.+\.xml)";
-            var match = Regex.Match(url, pattern);
+            var match = XmlPattern.Match(url);
 
             var baseUrl = match.Groups[1].Value;
 			var xmlFile = match.Groups[2].Value;
@@ -120,12 +121,13 @@ namespace darkorbit_resource_downloader
             {
                 LocalCollection = new FileCollection
                 {
-                    Files = new List<File>(),
-                    Locations = new List<Location>()
+                    Files = [],
+                    Locations = []
                 };
             }
 
-            var resourceXml = new WebClient().DownloadString(url);
+            using var wc = new WebClient();
+            var resourceXml = wc.DownloadString(url);
             RemoteCollection = XmlToT<FileCollection>(resourceXml);
             _totalFiles = RemoteCollection.Files.Count;
             System.IO.File.WriteAllText(xmlFile, resourceXml);
@@ -151,8 +153,14 @@ namespace darkorbit_resource_downloader
 		}
 
 		private static void DownloadFile(string baseUrl, File file)
-		{
-			var location = RemoteCollection.Locations.Find(loc => loc.Id == file.Location).Path;
+        {
+            var loc = RemoteCollection.Locations.FirstOrDefault(loc => loc.Id == file.Location);
+            if (loc == null)
+            {
+                Console.WriteLine($"Unable to find location for {file.Location}");
+                return;
+            }
+			var location = loc.Path;
 			Directory.CreateDirectory($"do_resources/{location}");
 
 			var filePath = $"do_resources/{location}{file.Name}.{file.Type}";
