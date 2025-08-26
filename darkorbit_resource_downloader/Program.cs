@@ -117,36 +117,130 @@ namespace darkorbit_resource_downloader
             ParseArgs(args);
             Http = CreateHttpClient(_maxParallel);
             _rateLimiter = CreateRateLimiter(_rps, _burst);
+            // Download additional standalone SWFs first
             var xmlFiles = new List<string>
             {
                 "https://darkorbit-22.bpsecure.com/spacemap/xml/resources.xml",
                 "https://darkorbit-22.bpsecure.com/spacemap/xml/resources_3d.xml",
-                "https://darkorbit-22.bpsecure.com/do_img/global/xml/resource_items.xml"
+                "https://darkorbit-22.bpsecure.com/do_img/global/xml/resource_items.xml",
+                "https://darkorbit-22.bpsecure.com/swf_global/inventory/xml/assets.xml",
+                "https://darkorbit-22.bpsecure.com/swf_global/xml/assets.xml",
             };
 
-            var fileChoices = xmlFiles
-                .Select(url => XmlPattern.Match(url).Groups[2].Value)
-                .ToList();
-
-            var selection = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
-                    .Title("[bold]Select a resource XML to download[/] (or choose All)")
-                    .PageSize(10)
-                    .AddChoices(fileChoices.Prepend("All"))
-            );
-
-            if (selection == "All")
+            foreach (var xmlFileUrl in xmlFiles)
             {
-                foreach (var xmlFileUrl in xmlFiles)
+                await ParseAndDownloadXmlFile(xmlFileUrl);
+            }
+            await DownloadAdditionalFilessAsync();
+            Console.ReadLine();
+        }
+
+        private static async Task DownloadAdditionalFilessAsync()
+        {
+            var urls = new List<string>
+            {
+                "https://darkorbit-22.bpsecure.com/spacemap/main.swf",
+                "https://darkorbit-22.bpsecure.com/swf_global/inventory/inventory.swf",
+                "https://darkorbit-22.bpsecure.com/spacemap/graphics/maps-config.xml",
+                "https://darkorbit-22.bpsecure.com/spacemap/graphics/spacemap-config.xml",
+                "https://darkorbit-22.bpsecure.com/spacemap/templates/en/flashres.xml",
+            };
+
+            AnsiConsole.Write(new Rule("[green]Downloading additional Files[/]"));
+
+            await AnsiConsole.Progress()
+                .AutoClear(false)
+                .Columns(new ProgressColumn[]
                 {
-                    await ParseAndDownloadXmlFile(xmlFileUrl);
-                }
+                    new TaskDescriptionColumn(),
+                    new ProgressBarColumn(),
+                    new PercentageColumn(),
+                    new RemainingTimeColumn(),
+                    new SpinnerColumn()
+                })
+                .StartAsync(async ctx =>
+                {
+                    var throttler = new SemaphoreSlim(_maxParallel);
+                    var tasks = new List<Task>();
+
+                    foreach (var url in urls)
+                    {
+                        await throttler.WaitAsync();
+                        var t = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await DownloadDirectUrlWithProgress(ctx, url);
+                            }
+                            finally
+                            {
+                                throttler.Release();
+                            }
+                        });
+                        tasks.Add(t);
+                    }
+
+                    await Task.WhenAll(tasks);
+                });
+        }
+
+        private static async Task DownloadDirectUrlWithProgress(ProgressContext ctx, string url)
+        {
+            var uri = new Uri(url);
+            var relativePath = uri.AbsolutePath.TrimStart('/');
+            var directory = Path.GetDirectoryName(relativePath)?.Replace('\\', '/') ?? string.Empty;
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory($"do_resources/{directory}");
+            }
+
+            var fileName = Path.GetFileName(relativePath);
+            var filePath = string.IsNullOrEmpty(directory)
+                ? $"do_resources/{fileName}"
+                : $"do_resources/{directory}/{fileName}";
+
+            if (System.IO.File.Exists(filePath))
+                return;
+
+            var task = ctx.AddTask(relativePath);
+
+            using var response = await SendWithRetryAsync(url);
+            response.EnsureSuccessStatusCode();
+            var contentLength = response.Content.Headers.ContentLength;
+
+            if (contentLength.HasValue && contentLength.Value > 0)
+            {
+                task.MaxValue = contentLength.Value;
             }
             else
             {
-                var selectedUrl = xmlFiles[fileChoices.IndexOf(selection)];
-                await ParseAndDownloadXmlFile(selectedUrl);
+                task.MaxValue = 100; // fallback when size unknown
             }
+
+            await using var input = await response.Content.ReadAsStreamAsync();
+            await using var output = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
+
+            var buffer = new byte[81920];
+            long totalRead = 0;
+            int read;
+            while ((read = await input.ReadAsync(buffer)) > 0)
+            {
+                await output.WriteAsync(buffer.AsMemory(0, read));
+                totalRead += read;
+
+                if (contentLength is > 0)
+                {
+                    task.Value = Math.Min(totalRead, contentLength.Value);
+                }
+                else
+                {
+                    task.Increment(1);
+                    if (task.Value >= task.MaxValue)
+                        task.Value = 0;
+                }
+            }
+
+            task.StopTask();
         }
 
         private static void ParseArgs(string[] args)
@@ -214,13 +308,15 @@ namespace darkorbit_resource_downloader
             _totalFiles = RemoteCollection.Files.Count;
             await System.IO.File.WriteAllTextAsync(xmlFile, resourceXml);
 
-            if (!AnsiConsole.Confirm($"Found {RemoteCollection.Files.Count} files for [yellow]{xmlFile}[/]. Proceed?"))
-                return;
+			AnsiConsole.MarkupLine($"Found {RemoteCollection.Files.Count} files for [yellow]{xmlFile}[/].");
 
             var sw = new Stopwatch();
             sw.Start();
 
             AnsiConsole.Write(new Rule($"[green]Downloading {xmlFile}[/]"));
+
+            int skipped = 0;
+            int total = RemoteCollection.Files.Count;
 
             await AnsiConsole.Progress()
                 .AutoClear(false)
@@ -234,8 +330,8 @@ namespace darkorbit_resource_downloader
                 })
                 .StartAsync(async ctx =>
                 {
-                    var overall = ctx.AddTask("[green]Overall[/]");
-                    overall.MaxValue = RemoteCollection.Files.Count;
+                    var xmlTask = ctx.AddTask($"[green]{xmlFile}[/]");
+                    xmlTask.MaxValue = total;
 
                     var throttler = new SemaphoreSlim(_maxParallel);
                     var tasks = new List<Task>();
@@ -247,11 +343,11 @@ namespace darkorbit_resource_downloader
                         {
                             try
                             {
-                                await DownloadFileWithProgress(ctx, baseUrl, f);
+                                await DownloadFileAsync(baseUrl, f, () => Interlocked.Increment(ref skipped));
                             }
                             finally
                             {
-                                overall.Increment(1);
+                                xmlTask.Increment(1);
                                 throttler.Release();
                             }
                         });
@@ -262,12 +358,10 @@ namespace darkorbit_resource_downloader
                 });
 
             sw.Stop();
-            AnsiConsole.MarkupLine($"[bold green]Done![/] Elapsed: [yellow]{sw.Elapsed}[/]. Skipped [yellow]{_skippedFiles}[/]/[yellow]{_totalFiles}[/] files.");
-            AnsiConsole.MarkupLine("Press Enter to exit...");
-            Console.ReadLine();
+            AnsiConsole.MarkupLine($"[bold green]Done![/] Elapsed: [yellow]{sw.Elapsed}[/]. Skipped [yellow]{skipped}[/]/[yellow]{total}[/] files.");
 		}
 
-        private static async Task DownloadFileWithProgress(ProgressContext ctx, string baseUrl, File file)
+        private static async Task DownloadFileAsync(string baseUrl, File file, Action onSkipped)
         {
             var loc = RemoteCollection.Locations.FirstOrDefault(loc => loc.Id == file.Location);
             if (loc == null)
@@ -283,59 +377,30 @@ namespace darkorbit_resource_downloader
             var localFile = LocalCollection.Files.Find(f => f == file);
             if (System.IO.File.Exists(filePath) && localFile?.Hash == file.Hash)
             {
-                AnsiConsole.MarkupLine($"[grey]Skipped[/] {file.Name}.{file.Type}");
-                Interlocked.Increment(ref _skippedFiles);
+                onSkipped();
             }
             else
             {
                 var url = $"{baseUrl}{location}{file.Name}.{file.Type}";
-
-                var task = ctx.AddTask($"{file.Name}.{file.Type}");
-
                 using var response = await SendWithRetryAsync(url);
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    AnsiConsole.MarkupLine($"[red]404 on {file.Name}.{file.Type} at {location}[/]");
+                    return;
+                }
+
                 response.EnsureSuccessStatusCode();
-                var contentLength = response.Content.Headers.ContentLength;
-
-                if (contentLength.HasValue && contentLength.Value > 0)
-                {
-                    task.MaxValue = contentLength.Value;
-                }
-                else
-                {
-                    task.MaxValue = 100; // fallback when size unknown
-                }
-
                 await using var input = await response.Content.ReadAsStreamAsync();
                 await using var output = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
 
                 var buffer = new byte[81920];
-                long totalRead = 0;
                 int read;
                 while ((read = await input.ReadAsync(buffer)) > 0)
                 {
                     await output.WriteAsync(buffer.AsMemory(0, read));
-                    totalRead += read;
-
-                    if (contentLength is > 0)
-                    {
-                        task.Value = Math.Min(totalRead, contentLength.Value);
-                    }
-                    else
-                    {
-                        // Tick up to simulate progress
-                        task.Increment(1);
-                        if (task.Value >= task.MaxValue)
-                            task.Value = 0; // loop when unknown size
-                    }
                 }
-
-                task.StopTask();
-
-                AnsiConsole.MarkupLine($"[green]Downloaded[/] {file.Name}.{file.Type}");
             }
         }
-
-        
 
         private static async Task<HttpResponseMessage> SendWithRetryAsync(string url)
         {
