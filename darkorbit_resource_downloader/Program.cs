@@ -315,8 +315,13 @@ namespace darkorbit_resource_downloader
 
             AnsiConsole.Write(new Rule($"[green]Downloading {xmlFile}[/]"));
 
+            // Process every file in the XML (no filtering).
+            var filesToProcess = RemoteCollection.Files.AsEnumerable();
+
             int skipped = 0;
-            int total = RemoteCollection.Files.Count;
+            int missing = 0;
+            int failed = 0;
+            int total = filesToProcess.Count();
 
             await AnsiConsole.Progress()
                 .AutoClear(false)
@@ -336,14 +341,26 @@ namespace darkorbit_resource_downloader
                     var throttler = new SemaphoreSlim(_maxParallel);
                     var tasks = new List<Task>();
 
-                    foreach (var f in RemoteCollection.Files)
+                    foreach (var f in filesToProcess)
                     {
                         await throttler.WaitAsync();
                         var t = Task.Run(async () =>
                         {
                             try
                             {
-                                await DownloadFileAsync(baseUrl, f, () => Interlocked.Increment(ref skipped));
+                                var outcome = await DownloadFileAsync(baseUrl, f);
+                                switch (outcome)
+                                {
+                                    case DownloadOutcome.Skipped:
+                                        Interlocked.Increment(ref skipped);
+                                        break;
+                                    case DownloadOutcome.Missing:
+                                        Interlocked.Increment(ref missing);
+                                        break;
+                                    case DownloadOutcome.Failed:
+                                        Interlocked.Increment(ref failed);
+                                        break;
+                                }
                             }
                             finally
                             {
@@ -358,16 +375,18 @@ namespace darkorbit_resource_downloader
                 });
 
             sw.Stop();
-            AnsiConsole.MarkupLine($"[bold green]Done![/] Elapsed: [yellow]{sw.Elapsed}[/]. Skipped [yellow]{skipped}[/]/[yellow]{total}[/] files.");
+            AnsiConsole.MarkupLine($"[bold green]Done![/] Elapsed: [yellow]{sw.Elapsed}[/]. Total [yellow]{total}[/], skipped [yellow]{skipped}[/], missing (404) [yellow]{missing}[/], failed [yellow]{failed}[/].");
 		}
 
-        private static async Task DownloadFileAsync(string baseUrl, File file, Action onSkipped)
+        private enum DownloadOutcome { Downloaded, Skipped, Missing, Failed }
+
+        private static async Task<DownloadOutcome> DownloadFileAsync(string baseUrl, File file)
         {
             var loc = RemoteCollection.Locations.FirstOrDefault(loc => loc.Id == file.Location);
             if (loc == null)
             {
                 AnsiConsole.MarkupLine($"[red]Unable to find location for[/] [yellow]{file.Location}[/]");
-                return;
+                return DownloadOutcome.Failed;
             }
             var location = loc.Path;
             Directory.CreateDirectory($"do_resources/{location}");
@@ -377,29 +396,52 @@ namespace darkorbit_resource_downloader
             var localFile = LocalCollection.Files.Find(f => f == file);
             if (System.IO.File.Exists(filePath) && localFile?.Hash == file.Hash)
             {
-                onSkipped();
+                return DownloadOutcome.Skipped;
             }
             else
             {
-                var url = $"{baseUrl}{location}{file.Name}.{file.Type}";
-                using var response = await SendWithRetryAsync(url);
-                if (response.StatusCode == HttpStatusCode.NotFound)
+                // Try a few URL variants to match how the client/CDN might expose files
+                var candidates = new List<string>
                 {
-                    AnsiConsole.MarkupLine($"[red]404 on {file.Name}.{file.Type} at {location}[/]");
-                    return;
+                    BuildFileUrl(baseUrl, file, lowercaseType: false, includeHash: true),
+                    BuildFileUrl(baseUrl, file, lowercaseType: true, includeHash: true),
+                    BuildFileUrl(baseUrl, file, lowercaseType: false, includeHash: false),
+                    BuildFileUrl(baseUrl, file, lowercaseType: true, includeHash: false)
+                };
+
+                foreach (var url in candidates.Distinct())
+                {
+                    using var response = await SendWithRetryAsync(url);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        if (response.StatusCode == HttpStatusCode.NotFound)
+                            continue; // try next variant
+                        return DownloadOutcome.Failed;
+                    }
+
+                    await using var input = await response.Content.ReadAsStreamAsync();
+                    await using var output = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
+
+                    var buffer = new byte[81920];
+                    int read;
+                    while ((read = await input.ReadAsync(buffer)) > 0)
+                    {
+                        await output.WriteAsync(buffer.AsMemory(0, read));
+                    }
+                    return DownloadOutcome.Downloaded;
                 }
 
-                response.EnsureSuccessStatusCode();
-                await using var input = await response.Content.ReadAsStreamAsync();
-                await using var output = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true);
-
-                var buffer = new byte[81920];
-                int read;
-                while ((read = await input.ReadAsync(buffer)) > 0)
-                {
-                    await output.WriteAsync(buffer.AsMemory(0, read));
-                }
+                return DownloadOutcome.Missing;
             }
+        }
+
+        private static string BuildFileUrl(string baseUrl, File file, bool lowercaseType, bool includeHash)
+        {
+            var typePart = lowercaseType ? file.Type?.ToLowerInvariant() : file.Type;
+            var url = $"{baseUrl}{RemoteCollection.Locations.First(l => l.Id == file.Location).Path}{file.Name}.{typePart}";
+            if (includeHash && !string.IsNullOrWhiteSpace(file.Hash))
+                url += (url.Contains('?') ? "&" : "?") + "__cv=" + file.Hash;
+            return url;
         }
 
         private static async Task<HttpResponseMessage> SendWithRetryAsync(string url)
