@@ -316,12 +316,12 @@ namespace darkorbit_resource_downloader
             AnsiConsole.Write(new Rule($"[green]Downloading {xmlFile}[/]"));
 
             // Process every file in the XML (no filtering).
-            var filesToProcess = RemoteCollection.Files.AsEnumerable();
+            var filesToProcess = RemoteCollection.Files;
 
             int skipped = 0;
             int missing = 0;
             int failed = 0;
-            int total = filesToProcess.Count();
+            int total = filesToProcess.Count;
 
             await AnsiConsole.Progress()
                 .AutoClear(false)

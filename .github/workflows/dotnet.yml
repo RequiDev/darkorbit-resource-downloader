@@ -65,7 +65,9 @@ jobs:
             -r $RID \
             -p:Version=${{ steps.ver.outputs.version }} \
             -o publish/$RID \
-            --no-build
+            --no-build \
+            -p:PublishSingleFile=true \
+            --self-contained false
 
       - name: Archive artifact (${{ matrix.rid }})
         run: |
